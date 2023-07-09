@@ -1,0 +1,7 @@
+[workspace]
+
+members = [
+	"panic_capture_macro",
+	"panic_capture_lib",
+	"axum_test"
+]
