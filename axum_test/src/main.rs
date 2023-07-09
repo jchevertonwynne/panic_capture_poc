@@ -1,7 +1,8 @@
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr, task::ready, time::Duration};
 
 use axum::{extract::Query, Json, Router};
 use futures::FutureExt;
+use http::StatusCode;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, Level};
@@ -24,8 +25,10 @@ async fn main() -> anyhow::Result<()> {
 
     info!("hello!");
 
-    let router = Router::new().route("/", axum::routing::get(my_route));
-    // .layer(PanicCatchLayer::default());
+    let router = Router::new()
+        .route("/", axum::routing::get(my_route))
+        .layer(StatusCounterLayer::new())
+        .layer(PanicCatchLayer::default());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 25565));
 
@@ -146,5 +149,112 @@ where
                 std::panic::resume_unwind(err)
             }
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StatusCounterLayer {
+    sender: async_channel::Sender<StatusCode>,
+}
+
+impl StatusCounterLayer {
+    fn new() -> Self {
+        let (tx, rx) = async_channel::unbounded();
+        {
+            tokio::spawn(async move {
+                let mut codes = HashMap::<StatusCode, usize>::default();
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+                loop {
+                    tokio::select! {
+                        channel_recv = rx.recv() => {
+                            let status_code = match channel_recv {
+                                Ok(status_code) => status_code,
+                                Err(_) => break,
+                            };
+                            *codes.entry(status_code).or_default() += 1;
+                        }
+                        _ = interval.tick() => {
+                            info!("status codes = {codes:?}");
+                        }
+                    }
+                }
+            });
+        }
+        Self { sender: tx }
+    }
+}
+
+impl<S> tower::Layer<S> for StatusCounterLayer {
+    type Service = StatusCounterService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StatusCounterService::new(inner, self.sender.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StatusCounterService<S> {
+    inner: S,
+    sender: async_channel::Sender<StatusCode>,
+}
+
+impl<S> StatusCounterService<S> {
+    fn new(inner: S, sender: async_channel::Sender<StatusCode>) -> Self {
+        Self { inner, sender }
+    }
+}
+
+impl<S, R, Res> tower::Service<R> for StatusCounterService<S>
+where
+    S: tower::Service<R, Response = http::Response<Res>>,
+{
+    type Response = S::Response;
+
+    type Error = S::Error;
+
+    type Future = StatusCounterFut<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: R) -> Self::Future {
+        let fut = self.inner.call(req);
+        let sender = self.sender.clone();
+        StatusCounterFut { fut, sender }
+    }
+}
+
+#[pin_project]
+struct StatusCounterFut<F> {
+    #[pin]
+    fut: F,
+    sender: async_channel::Sender<StatusCode>,
+}
+
+impl<F, Res, E> std::future::Future for StatusCounterFut<F>
+where
+    F: std::future::Future<Output = Result<http::Response<Res>, E>>,
+{
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        let rdy = ready!(this.fut.poll(cx));
+
+        if let Ok(resp) = rdy.as_ref() {
+            this.sender
+                .send_blocking(resp.status())
+                .expect("receiver should always be alive");
+        }
+
+        std::task::Poll::Ready(rdy)
     }
 }
