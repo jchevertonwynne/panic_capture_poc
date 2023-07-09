@@ -9,6 +9,7 @@ pub fn capture_panics(_args: TokenStream, items: TokenStream) -> TokenStream {
     let new_ident = Ident::new("__inner", f.sig.ident.span());
     f.sig.ident = new_ident;
 
+    #[allow(clippy::redundant_clone)]
     let return_type = f.sig.output.clone();
 
     quote!{

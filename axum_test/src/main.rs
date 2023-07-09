@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, time::Duration};
+use std::net::SocketAddr;
 
 use axum::{extract::Query, Json, Router};
 use futures::FutureExt;
@@ -24,9 +24,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!("hello!");
 
-    let router = Router::new()
-        .route("/", axum::routing::get(my_route))
-        .layer(PanicCatchLayer::default());
+    let router = Router::new().route("/", axum::routing::get(my_route));
+    // .layer(PanicCatchLayer::default());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 25565));
 
@@ -60,7 +59,6 @@ async fn my_route(
         denominator,
     }): Query<Params>,
 ) -> Json<Response> {
-    tokio::time::sleep(Duration::from_millis(100)).await;
     Json(Response {
         result: numerator / denominator,
     })

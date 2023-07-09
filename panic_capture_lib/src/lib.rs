@@ -2,7 +2,6 @@ use std::sync::atomic::AtomicUsize;
 
 pub use panic_capture_macro::capture_panics;
 
-
 pub fn increment_counter() -> usize {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
