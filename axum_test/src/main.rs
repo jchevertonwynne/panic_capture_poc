@@ -6,11 +6,11 @@ use std::{
 };
 
 use axum::{extract::Query, Json, Router};
-use futures::FutureExt;
+use futures::{FutureExt};
 use http::StatusCode;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
 use tracing::{error, info, Level};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
@@ -165,26 +165,26 @@ struct StatusCounterLayer {
 
 impl StatusCounterLayer {
     fn new() -> Self {
-        let (tx, mut rx) = unbounded_channel();
-        {
-            tokio::spawn(async move {
-                let mut codes = HashMap::<StatusCode, usize>::default();
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
-
-                loop {
-                    tokio::select! {
-                        channel_recv = rx.recv() => {
-                            let Some(status_code) = channel_recv else { break };
-                            *codes.entry(status_code).or_default() += 1;
-                        }
-                        _ = interval.tick() => {
-                            info!("status codes = {codes:?}");
-                        }
-                    }
-                }
-            });
-        }
+        let (tx, rx) = unbounded_channel();
+        tokio::spawn(status_loop(rx));
         Self { sender: tx }
+    }
+}
+
+async fn status_loop(mut rx: UnboundedReceiver<StatusCode>) {
+    let mut codes = HashMap::<StatusCode, usize>::default();
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            channel_recv = rx.recv() => {
+                let Some(status_code) = channel_recv else { break };
+                *codes.entry(status_code).or_default() += 1;
+            }
+            _ = interval.tick() => {
+                info!("status codes = {codes:?}");
+            }
+        }
     }
 }
 
