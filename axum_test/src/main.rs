@@ -1,10 +1,16 @@
-use std::{collections::HashMap, net::SocketAddr, task::ready, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    task::ready,
+    time::Duration,
+};
 
 use axum::{extract::Query, Json, Router};
 use futures::FutureExt;
 use http::StatusCode;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tracing::{error, info, Level};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
@@ -154,12 +160,12 @@ where
 
 #[derive(Debug, Clone)]
 struct StatusCounterLayer {
-    sender: async_channel::Sender<StatusCode>,
+    sender: UnboundedSender<StatusCode>,
 }
 
 impl StatusCounterLayer {
     fn new() -> Self {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         {
             tokio::spawn(async move {
                 let mut codes = HashMap::<StatusCode, usize>::default();
@@ -168,10 +174,7 @@ impl StatusCounterLayer {
                 loop {
                     tokio::select! {
                         channel_recv = rx.recv() => {
-                            let status_code = match channel_recv {
-                                Ok(status_code) => status_code,
-                                Err(_) => break,
-                            };
+                            let Some(status_code) = channel_recv else { break };
                             *codes.entry(status_code).or_default() += 1;
                         }
                         _ = interval.tick() => {
@@ -196,11 +199,11 @@ impl<S> tower::Layer<S> for StatusCounterLayer {
 #[derive(Debug, Clone)]
 struct StatusCounterService<S> {
     inner: S,
-    sender: async_channel::Sender<StatusCode>,
+    sender: UnboundedSender<StatusCode>,
 }
 
 impl<S> StatusCounterService<S> {
-    fn new(inner: S, sender: async_channel::Sender<StatusCode>) -> Self {
+    fn new(inner: S, sender: UnboundedSender<StatusCode>) -> Self {
         Self { inner, sender }
     }
 }
@@ -233,7 +236,7 @@ where
 struct StatusCounterFut<F> {
     #[pin]
     fut: F,
-    sender: async_channel::Sender<StatusCode>,
+    sender: UnboundedSender<StatusCode>,
 }
 
 impl<F, Res, E> std::future::Future for StatusCounterFut<F>
@@ -251,7 +254,7 @@ where
 
         if let Ok(resp) = rdy.as_ref() {
             this.sender
-                .send_blocking(resp.status())
+                .send(resp.status())
                 .expect("receiver should always be alive");
         }
 
