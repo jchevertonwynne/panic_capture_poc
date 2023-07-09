@@ -107,6 +107,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "axum",
+ "backtrace",
  "futures",
  "http",
  "panic_capture_lib",

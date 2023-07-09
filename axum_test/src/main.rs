@@ -4,6 +4,7 @@ use std::{
     task::ready,
     time::Duration,
 };
+use std::panic::PanicInfo;
 
 use axum::{extract::Query, Json, Router};
 use futures::{FutureExt};
@@ -28,6 +29,15 @@ async fn main() -> anyhow::Result<()> {
         ))
         .with(tracing_subscriber::fmt::layer())
         .try_init()?;
+
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info: &PanicInfo| {
+        let bt = backtrace::Backtrace::new();
+        if std::env::var_os("RUST_BACKTRACE").is_none() {
+            println!("caught panic, backtrace = \n{bt:?}");
+        }
+        hook(info)
+    }));
 
     info!("hello!");
 
@@ -208,9 +218,9 @@ impl<S> StatusCounterService<S> {
     }
 }
 
-impl<S, R, Res> tower::Service<R> for StatusCounterService<S>
+impl<S, Req, Res> tower::Service<Req> for StatusCounterService<S>
 where
-    S: tower::Service<R, Response = http::Response<Res>>,
+    S: tower::Service<Req, Response = http::Response<Res>>,
 {
     type Response = S::Response;
 
@@ -225,7 +235,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: R) -> Self::Future {
+    fn call(&mut self, req: Req) -> Self::Future {
         let fut = self.inner.call(req);
         let sender = self.sender.clone();
         StatusCounterFut { fut, sender }
@@ -239,9 +249,9 @@ struct StatusCounterFut<F> {
     sender: UnboundedSender<StatusCode>,
 }
 
-impl<F, Res, E> std::future::Future for StatusCounterFut<F>
+impl<F, Res, Err> std::future::Future for StatusCounterFut<F>
 where
-    F: std::future::Future<Output = Result<http::Response<Res>, E>>,
+    F: std::future::Future<Output = Result<http::Response<Res>, Err>>,
 {
     type Output = F::Output;
 
