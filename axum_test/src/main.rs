@@ -3,6 +3,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     panic::PanicInfo,
+    sync::Arc,
     task::ready,
     time::Duration,
 };
@@ -73,26 +74,32 @@ async fn main() -> anyhow::Result<()> {
 fn install_panic_handler(cancel: impl Future<Output = ()> + Send + 'static) -> JoinHandle<()> {
     let (tx, mut rx) = unbounded_channel();
 
-    let default_hook = std::panic::take_hook();
-    let handle = tokio::spawn(async move {
-        let mut traces = vec![];
-        let mut cancel = std::pin::pin!(cancel);
-        loop {
-            select! {
-                Some(bt) = rx.recv() => {
-                    traces.push(bt);
-                    info!("there are now {} backtraces collected", traces.len());
-                }
-                _ = cancel.as_mut() => {
-                    info!("shutting down panic handler");
-                    std::panic::set_hook(default_hook);
-                    break
+    let default_hook = Arc::new(std::panic::take_hook());
+
+    let handle = tokio::spawn({
+        let default_hook: Box<dyn Fn(&PanicInfo<'_>) + 'static + Sync + Send> = {
+            let default_hook = Arc::clone(&default_hook);
+            Box::new(move |info| default_hook(info))
+        };
+        async move {
+            let mut traces = vec![];
+            let mut cancel = std::pin::pin!(cancel);
+            loop {
+                select! {
+                    Some(bt) = rx.recv() => {
+                        traces.push(bt);
+                        info!("there are now {} backtraces collected", traces.len());
+                    }
+                    _ = cancel.as_mut() => {
+                        info!("shutting down panic handler");
+                        std::panic::set_hook(default_hook);
+                        break
+                    }
                 }
             }
         }
     });
 
-    let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info: &PanicInfo| {
         let bt = backtrace::Backtrace::new();
         tx.send(bt).expect("backtrace receiver was shut down");
