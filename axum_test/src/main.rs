@@ -1,19 +1,25 @@
 use std::{
     collections::HashMap,
+    future::Future,
     net::SocketAddr,
+    panic::PanicInfo,
     task::ready,
     time::Duration,
 };
-use std::panic::PanicInfo;
 
 use axum::{extract::Query, Json, Router};
-use futures::{FutureExt};
+use futures::FutureExt;
 use http::StatusCode;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
+use tokio::{
+    select,
+    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, Level};
-use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // to make a request panic send
 // curl 'localhost:25565?numerator=10&denominator=0'
@@ -30,14 +36,12 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .try_init()?;
 
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info: &PanicInfo| {
-        let bt = backtrace::Backtrace::new();
-        if std::env::var_os("RUST_BACKTRACE").is_none() {
-            println!("caught panic, backtrace = \n{bt:?}");
-        }
-        hook(info)
-    }));
+    let cancel_token = CancellationToken::new();
+
+    let panic_watcher_handle = install_panic_handler({
+        let cancel_token = cancel_token.clone();
+        async move { cancel_token.cancelled().await }
+    });
 
     info!("hello!");
 
@@ -50,15 +54,52 @@ async fn main() -> anyhow::Result<()> {
 
     info!("serving on {addr}");
 
-    let shutdown = tokio::signal::ctrl_c().map(|_| ());
     axum::Server::from_tcp(std::net::TcpListener::bind(addr)?)?
         .serve(router.into_make_service())
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(tokio::signal::ctrl_c().map(|_| ()))
         .await?;
+
+    info!("starting shutdown");
+
+    cancel_token.cancel();
+
+    panic_watcher_handle.await?;
 
     info!("goodbye!");
 
     panic!("oh no :(");
+}
+
+fn install_panic_handler(cancel: impl Future<Output = ()> + Send + 'static) -> JoinHandle<()> {
+    let (tx, mut rx) = unbounded_channel();
+
+    let default_hook = std::panic::take_hook();
+    let handle = tokio::spawn(async move {
+        let mut traces = vec![];
+        let mut cancel = std::pin::pin!(cancel);
+        loop {
+            select! {
+                Some(bt) = rx.recv() => {
+                    traces.push(bt);
+                    info!("there are now {} backtraces collected", traces.len());
+                }
+                _ = cancel.as_mut() => {
+                    info!("shutting down panic handler");
+                    std::panic::set_hook(default_hook);
+                    break
+                }
+            }
+        }
+    });
+
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info: &PanicInfo| {
+        let bt = backtrace::Backtrace::new();
+        tx.send(bt).expect("backtrace receiver was shut down");
+        default_hook(info)
+    }));
+
+    handle
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,9 +187,9 @@ impl<F> PanicWatchFuture<F> {
     }
 }
 
-impl<F> std::future::Future for PanicWatchFuture<F>
+impl<F> Future for PanicWatchFuture<F>
 where
-    F: std::future::Future,
+    F: Future,
 {
     type Output = F::Output;
 
@@ -183,12 +224,15 @@ impl StatusCounterLayer {
 
 async fn status_loop(mut rx: UnboundedReceiver<StatusCode>) {
     let mut codes = HashMap::<StatusCode, usize>::default();
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
 
     loop {
-        tokio::select! {
+        select! {
             channel_recv = rx.recv() => {
-                let Some(status_code) = channel_recv else { break };
+                let Some(status_code) = channel_recv else {
+                    info!("ending status loop!");
+                    break;
+                };
                 *codes.entry(status_code).or_default() += 1;
             }
             _ = interval.tick() => {
@@ -249,9 +293,9 @@ struct StatusCounterFut<F> {
     sender: UnboundedSender<StatusCode>,
 }
 
-impl<F, Res, Err> std::future::Future for StatusCounterFut<F>
+impl<F, Res, Err> Future for StatusCounterFut<F>
 where
-    F: std::future::Future<Output = Result<http::Response<Res>, Err>>,
+    F: Future<Output = Result<http::Response<Res>, Err>>,
 {
     type Output = F::Output;
 

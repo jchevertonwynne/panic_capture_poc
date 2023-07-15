@@ -20,3 +20,4 @@ panic_capture_lib = { path = "../panic_capture_lib" }
 http = "0.2.9"
 async-channel = "1.9.0"
 backtrace = "0.3.68"
+tokio-util = "0.7.8"
